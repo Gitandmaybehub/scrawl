@@ -192,6 +192,16 @@ enum LabCommand {
         /// Leave out the plain backdrop behind the capsule.
         #[arg(long)]
         no_backdrop: bool,
+        /// Draw the capsule with Rune (its own event loop) instead of the Metal panel.
+        #[arg(long)]
+        rune: bool,
+        /// With --rune: render resting states headless, a `.png` (`--state`) or every state
+        /// into a directory.
+        #[arg(long, requires = "rune")]
+        snap: Option<PathBuf>,
+        /// With --snap: the state to render (picker, recording-chips, completed, …).
+        #[arg(long, requires = "snap")]
+        state: Option<String>,
     },
 }
 
@@ -1964,6 +1974,9 @@ fn main() -> Result<()> {
                     repeat,
                     time_scale,
                     no_backdrop,
+                    rune,
+                    snap,
+                    state,
                 },
         } => {
             // Set before the app starts any thread; the lab reads them once.
@@ -1974,6 +1987,18 @@ fn main() -> Result<()> {
                 if let Some(scale) = time_scale {
                     std::env::set_var("SCRAWL_TIME_SCALE", scale.to_string());
                 }
+            }
+            if rune {
+                #[cfg(target_os = "macos")]
+                return ui::run_rune_lab(ui::RuneLabOptions {
+                    scene,
+                    repeat,
+                    backdrop: !no_backdrop,
+                    snap,
+                    state,
+                });
+                #[cfg(not(target_os = "macos"))]
+                anyhow::bail!("--rune is macOS-only for now ({snap:?} {state:?})");
             }
             ui::run_lab(ui::LabOptions {
                 scene,

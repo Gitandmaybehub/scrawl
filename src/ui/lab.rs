@@ -17,9 +17,9 @@ use crate::model::{CaptureMode, TargetFrame, TargetInfo};
 pub(super) const PROCESSING_S: f32 = 0.8;
 /// Quiet time before a scene's first step, so motion-lint's launch settle passes and a screen
 /// recording starts on a still frame.
-const LEAD_IN_S: f32 = 0.85;
+pub(super) const LEAD_IN_S: f32 = 0.85;
 /// Quiet time after the last step (and between repeats).
-const TAIL_S: f32 = 0.75;
+pub(super) const TAIL_S: f32 = 0.75;
 /// The backdrop: x offset from the display's centre line, top, width and height in points.
 /// The capsule window is 520 × 84 at y = 34, under the menu bar.
 pub const BACKDROP: [f32; 4] = [0.0, 38.0, 640.0, 76.0];
@@ -43,7 +43,7 @@ pub enum Scene {
 }
 
 #[derive(Clone, Copy, Debug)]
-enum Step {
+pub(super) enum Step {
     Tap,
     Chip(SelectionMode),
     Open,
@@ -67,7 +67,7 @@ impl Scene {
     }
 
     /// Steps at animation seconds from the scene's start.
-    fn steps(self) -> Vec<(f32, Step)> {
+    pub(super) fn steps(self) -> Vec<(f32, Step)> {
         use SelectionMode::{Area, Screen, Window};
         match self {
             Self::TapThenArea => vec![
