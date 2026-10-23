@@ -75,14 +75,10 @@ fn white(level: f32) -> Color {
 
 const SHELL: [f32; 3] = [20.0 / 255.0, 20.0 / 255.0, 22.0 / 255.0];
 
-/// White at `alpha` over the capsule, as AppKit composites it (in sRGB). Rune blends in linear
-/// light, where the same alpha reads far brighter, so this solves for the alpha that lands on
-/// the same colour.
+/// White at `alpha` over the capsule, as AppKit composites it (in sRGB): Rune blends in linear
+/// light, where the same alpha reads far brighter.
 fn veil(alpha: f32) -> Color {
-    let bg = SHELL[0];
-    let target = srgb_decode(alpha + (1.0 - alpha) * bg);
-    let bg_l = srgb_decode(bg);
-    Color { r: 1.0, g: 1.0, b: 1.0, a: ((target - bg_l) / (1.0 - bg_l)).clamp(0.0, 1.0) }
+    rune::theme::srgb_equivalent(Color::WHITE.alpha(alpha), srgb(SHELL[0], SHELL[1], SHELL[2], 1.0))
 }
 
 fn text_color() -> Color {
