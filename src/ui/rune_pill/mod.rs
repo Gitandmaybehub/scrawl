@@ -12,13 +12,14 @@ mod surface;
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use rune::color::srgb_decode;
 use rune::{
-    App, AppSpec, Color, Compositor, Cx, El, Frame, LineCap, Live, Path, RunOptions, Shape, SpringPair,
-    TextStyle, Transition, Tx, WindowOptions, WindowSpec, canvas, el, row, text,
+    App, AppSpec, Color, Compositor, Cx, DisplayTarget, El, Frame, LineCap, Live, NativeDisplayId, OverlayHandle,
+    OverlayInput, OverlayLevel, OverlayOptions, OverlayPlacement, OverlaySpec, Path, RunOptions, Shape, SpringPair,
+    TextStyle, Transition, Tx, WindowSpec, canvas, el, row, text,
 };
 
 use self::surface::{DONE_TEXT_X, LEAD_TEXT_X, PANEL_H, PROCESSING_TEXT_X, Shown, Surface};
@@ -33,6 +34,8 @@ pub struct Options {
     /// Headless goldens: a `.png` renders `state`; a directory renders every state into it.
     pub snap: Option<PathBuf>,
     pub state: Option<String>,
+    /// A real Screen capture made while the scene plays (`Capture`).
+    pub capture: Option<PathBuf>,
 }
 
 /// The states `--snap` renders, as they rest.
@@ -217,7 +220,38 @@ pub struct Lab {
     /// The scene's steps, shared with the Metal lab.
     timeline: Timeline,
     recording_since: Option<f64>,
+    /// Animation seconds the capsule went to `Hidden` at, so the overlay hides after the exit.
+    hidden_since: Option<f64>,
     now: f64,
+    ctl: Arc<Ctl>,
+}
+
+/// What `poll` tells the thread driving the overlay (`drive`), which has no view of the state.
+#[derive(Default)]
+struct Ctl {
+    /// The next poll, seconds on the overlay's clock as `f64` bits; 0 polls at once.
+    next: AtomicU64,
+    /// The last run's tail has passed.
+    done: AtomicBool,
+    /// The overlay should be shown: the capsule is up or still leaving.
+    shown: AtomicBool,
+    /// The picker is open, so the capsule follows the pointer between displays (the Metal
+    /// capsule's `follow_pointer_display`).
+    follow: AtomicBool,
+    driver: std::sync::OnceLock<std::thread::Thread>,
+}
+
+impl Ctl {
+    fn wake_at(&self, at: Option<f64>) {
+        self.next.store(at.unwrap_or(f64::INFINITY).to_bits(), Ordering::Release);
+        if let Some(driver) = self.driver.get() {
+            driver.unpark();
+        }
+    }
+
+    fn next(&self) -> f64 {
+        f64::from_bits(self.next.load(Ordering::Acquire))
+    }
 }
 
 impl Lab {
@@ -231,7 +265,10 @@ impl Lab {
             meter,
             timeline: Timeline::new(scene, repeat),
             recording_since: None,
+            // Hidden since long before the run, so the overlay starts hidden.
+            hidden_since: Some(f64::NEG_INFINITY),
             now: 0.0,
+            ctl: Arc::default(),
         }
     }
 
@@ -272,6 +309,9 @@ fn init() -> Lab {
 
 /// The lab's frame hook: tune reload, due surface steps, the scene's steps (the same `Timeline`
 /// the Metal lab steps), the clock.
+/// How long the capsule's exit gets before its overlay hides, in animation seconds.
+const HIDE_AFTER_S: f64 = 0.8;
+
 fn poll(s: &mut Lab, now: f64, tx: &mut Tx) -> bool {
     if s.backdrop.is_some() || s.still {
         return false;
@@ -296,7 +336,8 @@ fn poll(s: &mut Lab, now: f64, tx: &mut Tx) -> bool {
     }
     if due.done {
         motion::trace_close();
-        tx.quit();
+        s.ctl.done.store(true, Ordering::Release);
+        s.ctl.wake_at(None);
         return changed;
     }
 
@@ -317,9 +358,26 @@ fn poll(s: &mut Lab, now: f64, tx: &mut Tx) -> bool {
         let step = (at - anim) / scale;
         wake = Some(wake.map_or(step, |w| w.min(step)));
     }
-    if let Some(wake) = wake {
-        tx.wake_after(Duration::from_secs_f64(wake.max(0.0)));
+    // The overlay stays up while the capsule leaves, then hides (ordered in at alpha 0).
+    let hidden = matches!(s.surface.pres, Pres::Hidden);
+    let since = match (hidden, s.hidden_since) {
+        (true, None) => *s.hidden_since.insert(anim),
+        (true, Some(since)) => since,
+        (false, _) => {
+            s.hidden_since = None;
+            anim
+        }
+    };
+    let leaving = (since + HIDE_AFTER_S - anim) / scale;
+    if hidden && leaving > 0.0 {
+        wake = Some(wake.map_or(leaving, |w| w.min(leaving)));
     }
+    s.ctl.shown.store(!hidden || leaving > 0.0, Ordering::Release);
+    s.ctl.follow.store(
+        matches!(s.surface.pres, Pres::Selecting { mode, .. } if mode != SelectionMode::Iphone),
+        Ordering::Release,
+    );
+    s.ctl.wake_at(wake.map(|w| now + w.max(0.0)));
 
     for event in s.surface.events.drain(..) {
         motion::trace_event(event);
@@ -392,6 +450,9 @@ fn shell(surface: &Surface) -> El {
         .opacity(if surface.shell_on { 1.0 } else { 0.0 })
         .motion(surface.shell_motion)
         .opacity_motion(surface.shell_fade)
+        // The overlay takes clicks only on `.hit()` boxes: the island, so a click on it never
+        // reaches the app below, and the chips in it.
+        .hit()
 }
 
 fn label(content: &str, style: TextStyle, color: Color) -> El {
@@ -423,7 +484,7 @@ fn item(s: &Lab, shown: &Shown) -> El {
             if !shown.active {
                 chip = chip.hover(veil(0.08));
             }
-            chip.on_press(press)
+            chip.hit().on_press(press)
         }
         ElemId::Record | ElemId::Finish | ElemId::Paste => {
             let name = id.accessibility_label();
@@ -431,7 +492,7 @@ fn item(s: &Lab, shown: &Shown) -> El {
                 .fill(accent(false))
                 .hover(accent(true))
                 .child(label(name, SEMIBOLD, srgb(0.95, 0.95, 0.96, 1.0)))
-                .on_press(press)
+                .hit().on_press(press)
         }
         ElemId::Cancel | ElemId::Inspect | ElemId::Route0 | ElemId::Route1 => {
             let name = match (id, &s.surface.pres) {
@@ -443,12 +504,12 @@ fn item(s: &Lab, shown: &Shown) -> El {
                 .hover(veil(0.08))
                 .press(veil(0.06))
                 .child(label(&name, MEDIUM, white(0.74)))
-                .on_press(press)
+                .hit().on_press(press)
         }
         ElemId::Close => base.child(
             row().center().size(28.0, 28.0).radius(14.0).hover(veil(0.10)).press(veil(0.06))
                 .child(canvas(icon(id, 12.0 * 2.4 / 24.0, white(0.61))).size(12.0, 12.0))
-                .on_press(press),
+                .hit().on_press(press),
         ),
         ElemId::Lead => placed(el(), shown)
             .child(dot(&s.meter))
@@ -575,7 +636,9 @@ fn icon(id: ElemId, width: f32, color: Color) -> Shape {
 // ─── Motion trace ────────────────────────────────────────────────────────────────────────────
 
 /// Draws Rune's frame, then writes it to the motion-lint trace with the Metal capsule's names
-/// (`shell`, `lead`, `chip:Area`, … in screen points), so the two traces compare.
+/// (`shell`, `lead`, `chip:Area`, … in screen points), so the two traces compare. Unused while
+/// Rune's overlays take no compositor (asked of Rune); the window host used it.
+#[allow(dead_code)]
 struct TraceFrames {
     origin: [f32; 2],
 }
@@ -619,32 +682,6 @@ impl Compositor<Lab> for TraceFrames {
 }
 
 // ─── Running ───────────────────────────────────────────────────────────────────────────────
-
-/// What Rune's window options don't cover, set on the native window as the Metal panel sets
-/// them: no window shadow (AppKit outlines a transparent window's opaque pixels with one), the
-/// status-window level plus `level`, every Space, never hidden on deactivation.
-fn panel_window(window: rune::WindowHandle, level: isize) {
-    use objc2_app_kit::{NSStatusWindowLevel, NSView, NSWindowCollectionBehavior};
-    use rune::raw_window_handle::RawWindowHandle;
-    let result = window.with_raw_handle(|handle| {
-        let RawWindowHandle::AppKit(appkit) = handle.as_raw() else { return };
-        // SAFETY: on the main thread (`on_created`), the view lives as long as its window.
-        let view: &NSView = unsafe { appkit.ns_view.cast().as_ref() };
-        let Some(ns_window) = view.window() else { return };
-        ns_window.setHasShadow(false);
-        ns_window.setHidesOnDeactivate(false);
-        ns_window.setLevel(NSStatusWindowLevel + level);
-        ns_window.setCollectionBehavior(
-            NSWindowCollectionBehavior::CanJoinAllSpaces
-                | NSWindowCollectionBehavior::FullScreenAuxiliary
-                | NSWindowCollectionBehavior::Stationary
-                | NSWindowCollectionBehavior::IgnoresCycle,
-        );
-    });
-    if let Err(error) = result {
-        eprintln!("rune lab: can't configure the window: {error}");
-    }
-}
 
 // ─────────────────────────────────────────────────────────────────────────────────
 
@@ -736,70 +773,292 @@ pub fn run(options: Options) -> anyhow::Result<()> {
         })?),
         None => None,
     };
-    let Options { scene, repeat, backdrop, .. } = options;
-    rune::run_windows_with(RunOptions { accessory: true }, move |displays| {
-        // Where the Metal capsule's panel goes on the primary display, in global points.
-        let screen = crate::screens::current().into_iter().next();
-        let (frame, origin) = match &screen {
-            Some(s) => {
-                let [x, y] = crate::screens::pill_origin(s, f64::from(PANEL_W), f64::from(PANEL_Y));
-                ([s.frame[2] as f32, s.frame[3] as f32], [x as f32, y as f32])
-            }
-            None => ([1440.0, 900.0], [400.0, PANEL_Y]),
-        };
-        let scale = displays.iter().find(|d| d.primary).or(displays.first()).map_or(2.0, |d| d.scale as f32);
-        let physical = |x: f32, y: f32| ((x * scale).round() as i32, (y * scale).round() as i32);
-        let place = |x: f32, y: f32| WindowOptions {
-            borderless: true,
-            always_on_top: true,
-            position: Some(physical(x, y)),
-            min_size: Some((0.0, 0.0)),
-            resizable: false,
-            ..WindowOptions::default()
-        };
-
-        let meter = Meter::new();
-        let mut lab = Lab::capsule(scene, repeat, meter.clone());
-        let mut windows = Vec::new();
-        if let Some((pres, clock)) = still {
+    let Options { scene, repeat, backdrop, capture, .. } = options;
+    if let Some((pres, clock)) = still {
+        // Headless (Rune draws no overlays there): one window with the state at rest.
+        rune::run_windows_with(RunOptions { accessory: true }, move |_| {
+            let mut lab = Lab::capsule(scene, repeat, Meter::new());
             lab.still = true;
             lab.surface.clock = clock.to_owned();
             let surface = std::mem::replace(&mut lab.surface, Surface::new(motion::tune(), Default::default()));
             lab.surface = surface.settled(pres);
-        } else {
-            motion::trace_open(&format!("pill.{}", scene.name()), frame);
-            meter.clone().spawn();
-            let backdrop_x = ((frame[0] - BACKDROP[2]) * 0.5).round();
-            // For screen recordings (`perf/pill/record.sh`): the backdrop's rect in screen points.
-            println!("region {},{},{},{}", backdrop_x, BACKDROP[1], BACKDROP[2], BACKDROP[3]);
-            if backdrop {
-                let theme = std::env::var("SCRAWL_LAB_BACKDROP").unwrap_or_default().to_ascii_lowercase();
-                let fill = match theme.trim() {
-                    "dark" | "busy-dark" => srgb(0.059, 0.067, 0.090, 1.0),
-                    "light" | "white" => srgb(0.980, 0.980, 0.988, 1.0),
-                    _ => srgb(0.851, 0.851, 0.871, 1.0),
-                };
-                let mut state = Lab::capsule(scene, repeat, meter);
-                state.backdrop = Some(fill);
-                windows.push(
-                    WindowSpec::new("backdrop", spec((BACKDROP[2], BACKDROP[3]), fonts))
-                        .state(state)
-                        .options(place(backdrop_x, BACKDROP[1]))
-                        .on_created(|window| panel_window(window, 0)),
-                );
-            }
-        }
-        // Opened after (so above) the backdrop.
-        let app = App::new(spec((PANEL_W, PANEL_H), fonts)).compositor(TraceFrames { origin });
-        windows.push(
-            WindowSpec::from_app("capsule", app)
-                .state(lab)
-                .options(WindowOptions { transparent: true, ..place(origin[0], origin[1]) })
-                .on_created(|window| panel_window(window, 5)),
+            let app = App::new(spec((PANEL_W, PANEL_H), fonts));
+            vec![WindowSpec::from_app("capsule", app).state(lab)]
+        });
+        return Ok(());
+    }
+    rune::run_windows_with(RunOptions { accessory: true }, move |_| {
+        let places = places();
+        let start = crate::screens::pointer()
+            .and_then(|p| crate::screens::index_at(&crate::screens::current(), p))
+            .unwrap_or(0);
+        let Some(here) = places.get(start).cloned() else {
+            eprintln!("rune lab: no display");
+            std::process::exit(1);
+        };
+        let exclude = Exclude::from_env();
+        let frame = [here.frame[2] as f32, here.frame[3] as f32];
+        motion::trace_open(&format!("pill.{}", scene.name()), frame);
+        // For screen recordings (`perf/pill/record.sh`): the backdrop's rect in global points.
+        println!(
+            "region {},{},{},{}",
+            here.frame[0] as f32 + here.backdrop[0],
+            here.frame[1] as f32 + here.backdrop[1],
+            BACKDROP[2],
+            BACKDROP[3]
         );
-        windows
+
+        let meter = Meter::new();
+        meter.clone().spawn();
+        let mut app = App::new(spec((PANEL_W, PANEL_H), fonts)).windowless();
+        let backdrop = backdrop.then(|| {
+            let mut state = Lab::capsule(scene, repeat, meter.clone());
+            state.backdrop = Some(backdrop_fill());
+            let overlay = app.overlay(
+                OverlaySpec::new("Scrawl capsule backdrop (Rune)", (BACKDROP[2], BACKDROP[3]), view).options(
+                    OverlayOptions { level: OverlayLevel::Status, input: OverlayInput::None, ..Default::default() },
+                ),
+                state,
+            );
+            place(&overlay, &here, here.backdrop, [BACKDROP[2], BACKDROP[3]]);
+            overlay.show();
+            overlay
+        });
+
+        let lab = Lab::capsule(scene, repeat, meter);
+        let ctl = lab.ctl.clone();
+        let excluded: Arc<std::sync::Mutex<Vec<u32>>> = Arc::default();
+        let capture = capture.map(|dir| Arc::new(Capture::new(dir, excluded.clone())));
+        let created = capture.clone();
+        // The overlay's clock (`Runtime::wall_start`) starts as it's made.
+        let t0 = Instant::now();
+        let pill = app.overlay(
+            OverlaySpec::new("Scrawl capsule (Rune)", (PANEL_W, PANEL_H), view)
+                .options(OverlayOptions {
+                    // Above the picker (`AboveStatus`) and the backdrop.
+                    level: OverlayLevel::AboveOverlays,
+                    input: OverlayInput::Regions,
+                    exclude_from_capture: exclude.native,
+                    prewarm: true,
+                    ..Default::default()
+                })
+                .on_created(move |made| {
+                    eprintln!(
+                        "rune lab: capsule overlay window {:?}, native capture exclusion {:?}",
+                        made.window_number, made.capabilities.capture_exclusion
+                    );
+                    if let Some(id) = made.window_number
+                        && exclude.filter
+                    {
+                        excluded.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(id);
+                    }
+                    if let Some(capture) = created {
+                        std::thread::spawn(move || capture.start());
+                    }
+                }),
+            lab,
+        );
+        place(&pill, &here, here.pill, [PANEL_W, PANEL_H]);
+        let quit = app.handle();
+        std::thread::Builder::new()
+            .name("rune-pill-driver".into())
+            .spawn(move || drive(Driver { pill, backdrop, ctl, t0, places, at: start, capture }, quit))
+            .expect("driver thread");
+        vec![WindowSpec::from_app("lab", app)]
     });
     Ok(())
+}
+
+/// `SCRAWL_LAB_BACKDROP`: grey (default), light or dark.
+fn backdrop_fill() -> Color {
+    let theme = std::env::var("SCRAWL_LAB_BACKDROP").unwrap_or_default().to_ascii_lowercase();
+    match theme.trim() {
+        "dark" | "busy-dark" => srgb(0.059, 0.067, 0.090, 1.0),
+        "light" | "white" => srgb(0.980, 0.980, 0.988, 1.0),
+        _ => srgb(0.851, 0.851, 0.871, 1.0),
+    }
+}
+
+/// How the capsule stays out of screen captures (`SCRAWL_LAB_EXCLUDE`): `both` (the default, as
+/// the app does), `filter` (Scrawl's ScreenCaptureKit filter only), `native` (the panel's
+/// `sharingType` only) or `none` (so another recorder can film it).
+#[derive(Clone, Copy)]
+struct Exclude {
+    native: bool,
+    filter: bool,
+}
+
+impl Exclude {
+    fn from_env() -> Self {
+        match std::env::var("SCRAWL_LAB_EXCLUDE").unwrap_or_default().trim() {
+            "none" => Self { native: false, filter: false },
+            "native" => Self { native: true, filter: false },
+            "filter" => Self { native: false, filter: true },
+            _ => Self { native: true, filter: true },
+        }
+    }
+}
+
+/// Where the capsule and the backdrop go on one display, in its local points (what
+/// `OverlayPlacement::Rect` takes).
+#[derive(Clone, Debug)]
+struct Place {
+    display: u32,
+    /// Global points, to find the pointer's display.
+    frame: [f64; 4],
+    pill: [f32; 2],
+    backdrop: [f32; 2],
+}
+
+/// Every display's places, from `screens::pill_origin` (below the menu bar or notch, centred).
+/// Main thread.
+fn places() -> Vec<Place> {
+    crate::screens::current()
+        .iter()
+        .map(|s| {
+            let [x, y] = crate::screens::pill_origin(s, f64::from(PANEL_W), f64::from(PANEL_Y));
+            let f = s.frame;
+            Place {
+                display: s.id,
+                frame: f,
+                pill: [(x - f[0]) as f32, (y - f[1]) as f32],
+                backdrop: [((f[2] as f32 - BACKDROP[2]) * 0.5).round(), BACKDROP[1]],
+            }
+        })
+        .collect()
+}
+
+fn place<T>(overlay: &OverlayHandle<T>, place: &Place, at: [f32; 2], size: [f32; 2]) {
+    overlay.set_display(DisplayTarget::Native(NativeDisplayId::MacOS(place.display)));
+    overlay.set_placement(Some(OverlayPlacement::Rect { x: at[0], y: at[1], width: size[0], height: size[1] }));
+}
+
+/// `--capture DIR`: a real Screen capture of the capsule's display while the scene plays, with
+/// the capsule's window in Scrawl's ScreenCaptureKit exclusion list, finished into a bundle. It
+/// runs in a child (`scrawl lab capture`): ScreenCaptureKit drives ReplayKit on this process's
+/// main queue, which sets every window's style mask, and winit's window delegate panics on the
+/// appearance change that sends (a Rune gap). The child is Scrawl.app's too, so it has the grant.
+struct Capture {
+    dir: PathBuf,
+    excluded: Arc<std::sync::Mutex<Vec<u32>>>,
+    child: std::sync::Mutex<Option<std::process::Child>>,
+    /// The capture has started (or failed to): the scene may begin.
+    started: AtomicBool,
+}
+
+impl Capture {
+    fn new(dir: PathBuf, excluded: Arc<std::sync::Mutex<Vec<u32>>>) -> Self {
+        Self { dir, excluded, child: std::sync::Mutex::default(), started: AtomicBool::new(false) }
+    }
+
+    fn start(&self) {
+        if let Err(error) = self.begin() {
+            eprintln!("rune lab: capture didn't start: {error:#}");
+        }
+        self.started.store(true, Ordering::Release);
+    }
+
+    fn begin(&self) -> anyhow::Result<()> {
+        use std::io::BufRead;
+        let excluded = self.excluded.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+        let mut command = std::process::Command::new(std::env::current_exe()?);
+        command.args(["lab", "capture", "--out"]).arg(&self.dir);
+        for id in &excluded {
+            command.args(["--exclude", &id.to_string()]);
+        }
+        let mut child = command
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .env_remove("SCRAWL_MOTION_TRACE")
+            .spawn()?;
+        let stdout = child.stdout.take().expect("piped");
+        let mut lines = std::io::BufReader::new(stdout).lines();
+        anyhow::ensure!(
+            lines.next().transpose()?.as_deref() == Some("started"),
+            "the capture child didn't start"
+        );
+        // The rest of its output (the bundle line) passes through.
+        std::thread::spawn(move || lines.map_while(Result::ok).for_each(|line| println!("{line}")));
+        eprintln!("rune lab: capturing, excluding windows {excluded:?}");
+        *self.child.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(child);
+        Ok(())
+    }
+
+    /// Closes the child's stdin, so it stops and builds the bundle, and waits for it.
+    fn finish(&self) -> anyhow::Result<()> {
+        let Some(mut child) = self.child.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take() else {
+            anyhow::bail!("the capture never started");
+        };
+        drop(child.stdin.take());
+        let status = child.wait()?;
+        anyhow::ensure!(status.success(), "the capture child failed ({status})");
+        Ok(())
+    }
+}
+
+/// Plays the scene into the overlay from outside: Rune's overlays take `update`s but have no
+/// poll hook yet, so this thread runs `poll` when it asked to be run, shows and hides the
+/// overlay, moves it to the pointer's display while the picker is open, and quits.
+struct Driver {
+    pill: OverlayHandle<Lab>,
+    backdrop: Option<OverlayHandle<Lab>>,
+    ctl: Arc<Ctl>,
+    t0: Instant,
+    places: Vec<Place>,
+    at: usize,
+    capture: Option<Arc<Capture>>,
+}
+
+fn drive(mut d: Driver, quit: rune::AppHandle<Lab>) {
+    let _ = d.ctl.driver.set(std::thread::current());
+    // A capture records the whole scene: it starts first.
+    let waiting = Instant::now();
+    while d.capture.as_ref().is_some_and(|c| !c.started.load(Ordering::Acquire))
+        && waiting.elapsed() < Duration::from_secs(10)
+    {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let mut shown = false;
+    loop {
+        if d.ctl.done.load(Ordering::Acquire) {
+            break;
+        }
+        let now = d.t0.elapsed().as_secs_f64();
+        let next = d.ctl.next();
+        if next <= now {
+            // Nothing more until this poll says when.
+            d.ctl.next.store(f64::INFINITY.to_bits(), Ordering::Release);
+            let t0 = d.t0;
+            d.pill.update(move |s, tx| {
+                poll(s, t0.elapsed().as_secs_f64(), tx);
+            });
+        }
+        let want = d.ctl.shown.load(Ordering::Acquire);
+        if want != shown {
+            shown = want;
+            if want { d.pill.show() } else { d.pill.hide() }
+        }
+        if d.ctl.follow.load(Ordering::Acquire)
+            && let Some(p) = crate::screens::pointer()
+            && let Some(i) = d.places.iter().position(|pl| crate::screens::contains(pl.frame, p))
+            && i != d.at
+        {
+            d.at = i;
+            let here = &d.places[i];
+            place(&d.pill, here, here.pill, [PANEL_W, PANEL_H]);
+            if let Some(backdrop) = &d.backdrop {
+                place(backdrop, here, here.backdrop, [BACKDROP[2], BACKDROP[3]]);
+            }
+        }
+        let wait = (d.ctl.next() - d.t0.elapsed().as_secs_f64()).clamp(0.0, 0.05);
+        std::thread::park_timeout(Duration::from_secs_f64(wait));
+    }
+    if let Some(capture) = &d.capture
+        && let Err(error) = capture.finish()
+    {
+        eprintln!("rune lab: capture failed: {error:#}");
+    }
+    quit.quit();
 }
 
 #[cfg(test)]

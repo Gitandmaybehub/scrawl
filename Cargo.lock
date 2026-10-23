@@ -5276,10 +5276,11 @@ checksum = "6c20b6793b5c2fa6553b250154b78d6d0db37e72700ae35fad9387a46f487c97"
 [[package]]
 name = "rune"
 version = "0.0.1"
-source = "git+https://github.com/anomalyco/rune?rev=683f4d4c42c478cf7ebac1f468c30ea45ab9b27d#683f4d4c42c478cf7ebac1f468c30ea45ab9b27d"
+source = "git+https://github.com/anomalyco/rune?rev=28ef7186f40e4fee1e7b6976de2cd2c937ed3532#28ef7186f40e4fee1e7b6976de2cd2c937ed3532"
 dependencies = [
  "arboard",
  "blake3",
+ "block2 0.5.1",
  "bytemuck",
  "image",
  "objc2 0.5.3",
@@ -5306,12 +5307,14 @@ dependencies = [
  "wgpu",
  "windows-sys 0.59.0",
  "winit",
+ "x11rb",
+ "xkbcommon",
 ]
 
 [[package]]
 name = "rune-motion"
 version = "0.1.0"
-source = "git+https://github.com/anomalyco/rune?rev=683f4d4c42c478cf7ebac1f468c30ea45ab9b27d#683f4d4c42c478cf7ebac1f468c30ea45ab9b27d"
+source = "git+https://github.com/anomalyco/rune?rev=28ef7186f40e4fee1e7b6976de2cd2c937ed3532#28ef7186f40e4fee1e7b6976de2cd2c937ed3532"
 
 [[package]]
 name = "rust-embed"
@@ -7958,6 +7961,17 @@ name = "xcursor"
 version = "0.3.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "163b33ed8786455e2fa5d72f554057ce3f3182425434f756cd39c99839d88e23"
+
+[[package]]
+name = "xkbcommon"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a7a974f48060a14e95705c01f24ad9c3345022f4d97441b8a36beb7ed5c4a02d"
+dependencies = [
+ "libc",
+ "memmap2",
+ "xkeysym",
+]
 
 [[package]]
 name = "xkbcommon-dl"

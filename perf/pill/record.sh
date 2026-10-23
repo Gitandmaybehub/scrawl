@@ -17,7 +17,8 @@ scale_args=()
 while [[ ${1:-} == --* ]]; do
   case $1 in
     --time-scale) scale_args+=(--time-scale "$2"); shift 2 ;;
-    --rune) scale_args+=(--rune); shift ;; # the Rune capsule (`scrawl lab pill --rune`)
+    # The Rune capsule (`scrawl lab pill --rune`), left in captures so the recorder sees it.
+    --rune) scale_args+=(--rune); export SCRAWL_LAB_EXCLUDE=none; shift ;;
     *) echo "unknown option $1" >&2; exit 2 ;;
   esac
 done
