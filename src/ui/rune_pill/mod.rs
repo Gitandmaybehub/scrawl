@@ -371,8 +371,9 @@ fn poll(s: &mut Lab, now: f64, tx: &mut Tx) -> bool {
     if hidden && leaving > 0.0 {
         wake = Some(wake.map_or(leaving, |w| w.min(leaving)));
     }
-    // Rune settles every transition when an overlay shows, so it shows before the step that
-    // brings the capsule in, not with it (the hidden capsule draws nothing).
+    // A change made while the overlay is hidden is settled when it shows (`show` re-warms a
+    // dirty prewarmed overlay), so it shows before the step that brings the capsule in, not
+    // with it (the hidden capsule draws nothing).
     let ahead = s.timeline.next_at().map(|at| (at - anim) / scale - SHOW_AHEAD_S);
     let soon = ahead.is_some_and(|a| a <= 0.0);
     if hidden && let Some(a) = ahead.filter(|a| *a > 0.0) {
