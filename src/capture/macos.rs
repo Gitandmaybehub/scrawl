@@ -1740,10 +1740,12 @@ pub fn post_synthetic_click(screen_x: f64, screen_y: f64) {
 /// 120 Hz poller of modifier flags and mouse buttons, neither of which needs a permission, so
 /// Shift-laser (`⇧` + move) and Shift-drag ink (`⇧` + drag) work across all apps (including
 /// Karabiner's virtual HID). Every 500 ms it also keeps the key tap in step with Accessibility.
-/// Key codes are never polled: reading them is Input Monitoring's.
+/// Key codes are never polled: reading them is Input Monitoring's. A plain left-drag (no ⌘⌃⌥)
+/// inks too, once it moves `LEFT_INK_START_PT` from where it went down.
 fn run_global_hid_poller(telemetry: Arc<SharedCaptureTelemetry>) {
     let mut prev_shift_ink = false;
     let mut await_shift_release = false;
+    let mut left_press: Option<(f64, f64)> = None;
     let mut prev_mod_mask = 0_u8;
     let mut prev_buttons = [false; 2];
     let mut last_tap_check: Option<Instant> = None;
@@ -1782,6 +1784,7 @@ fn run_global_hid_poller(telemetry: Arc<SharedCaptureTelemetry>) {
         };
         if !telemetry.active.load(Ordering::Acquire) {
             prev_shift_ink = false;
+            left_press = None;
             prev_buttons = buttons;
             continue;
         }
@@ -1794,6 +1797,7 @@ fn run_global_hid_poller(telemetry: Arc<SharedCaptureTelemetry>) {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = [loc.x as f32, loc.y as f32];
 
+        let left_was_down = prev_buttons[0];
         poll_clicks(
             &telemetry,
             &mut prev_buttons,
@@ -1803,13 +1807,34 @@ fn run_global_hid_poller(telemetry: Arc<SharedCaptureTelemetry>) {
             |x, y| telemetry.on_scrawl_window(x, y),
         );
 
-        let pure_shift = shift && !cmd && !ctrl && !alt && !await_shift_release;
-        // Hold Shift + move cursor inside the capture target = draw a persistent stroke.
-        track_shift_ink(&telemetry, (loc.x, loc.y), pure_shift, prev_shift_ink);
+        // A plain left press (not on Scrawl's own windows) can ink; a still click never does.
+        if !buttons[0] || cmd || ctrl || alt {
+            left_press = None;
+        } else if !left_was_down && !telemetry.on_scrawl_window(loc.x, loc.y) {
+            left_press = Some((loc.x, loc.y));
+        }
+        let left_ink = left_press.is_some_and(|(x0, y0)| {
+            prev_shift_ink || (loc.x - x0).hypot(loc.y - y0) >= LEFT_INK_START_PT
+        });
 
-        prev_shift_ink = pure_shift;
+        let pure_shift = shift && !cmd && !ctrl && !alt && !await_shift_release;
+        let ink = pure_shift || left_ink;
+        // A left-drag's ink starts where the button went down, not where it passed the threshold.
+        if ink && !prev_shift_ink && !pure_shift
+            && let Some(start) = left_press
+        {
+            track_shift_ink(&telemetry, start, true, false);
+        }
+        // Hold Shift (or the left button) + move cursor inside the capture target = draw a
+        // persistent stroke.
+        track_shift_ink(&telemetry, (loc.x, loc.y), ink, prev_shift_ink);
+
+        prev_shift_ink = ink;
     }
 }
+
+/// How far (points) a plain left press moves before it inks, so clicks leave no dot.
+const LEFT_INK_START_PT: f64 = 3.0;
 
 /// The key of a logged shortcut as the user's keyboard layout labels it (Dvorak's ⌘B, not the
 /// QWERTY ⌘N at the same position).
