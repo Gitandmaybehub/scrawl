@@ -887,7 +887,9 @@ fn backdrop_fill() -> Color {
 
 /// How the capsule stays out of screen captures (`SCRAWL_LAB_EXCLUDE`): `both` (the default, as
 /// the app does), `filter` (Scrawl's ScreenCaptureKit filter only), `native` (the panel's
-/// `sharingType` only) or `none` (so another recorder can film it).
+/// `sharingType` only) or `none` (so another recorder can film it). Scrawl's own capture
+/// (`--capture`) leaves out every window of this process above layer 0 anyway, the overlays
+/// included, so the modes only change what other processes' captures see.
 #[derive(Clone, Copy)]
 struct Exclude {
     native: bool,
@@ -940,21 +942,19 @@ fn place<T>(overlay: &OverlayHandle<T>, place: &Place, at: [f32; 2], size: [f32;
 }
 
 /// `--capture DIR`: a real Screen capture of the capsule's display while the scene plays, with
-/// the capsule's window in Scrawl's ScreenCaptureKit exclusion list, finished into a bundle. It
-/// runs in a child (`scrawl lab capture`): ScreenCaptureKit drives ReplayKit on this process's
-/// main queue, which sets every window's style mask, and winit's window delegate panics on the
-/// appearance change that sends (a Rune gap). The child is Scrawl.app's too, so it has the grant.
+/// the capsule's window in Scrawl's ScreenCaptureKit exclusion list (as the app excludes the
+/// Metal panel), finished into a bundle.
 struct Capture {
     dir: PathBuf,
     excluded: Arc<std::sync::Mutex<Vec<u32>>>,
-    child: std::sync::Mutex<Option<std::process::Child>>,
+    session: std::sync::Mutex<Option<(crate::model::TargetInfo, crate::capture::ScreenCaptureSession)>>,
     /// The capture has started (or failed to): the scene may begin.
     started: AtomicBool,
 }
 
 impl Capture {
     fn new(dir: PathBuf, excluded: Arc<std::sync::Mutex<Vec<u32>>>) -> Self {
-        Self { dir, excluded, child: std::sync::Mutex::default(), started: AtomicBool::new(false) }
+        Self { dir, excluded, session: std::sync::Mutex::default(), started: AtomicBool::new(false) }
     }
 
     fn start(&self) {
@@ -965,39 +965,37 @@ impl Capture {
     }
 
     fn begin(&self) -> anyhow::Result<()> {
-        use std::io::BufRead;
-        let excluded = self.excluded.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
-        let mut command = std::process::Command::new(std::env::current_exe()?);
-        command.args(["lab", "capture", "--out"]).arg(&self.dir);
-        for id in &excluded {
-            command.args(["--exclude", &id.to_string()]);
-        }
-        let mut child = command
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .env_remove("SCRAWL_MOTION_TRACE")
-            .spawn()?;
-        let stdout = child.stdout.take().expect("piped");
-        let mut lines = std::io::BufReader::new(stdout).lines();
-        anyhow::ensure!(
-            lines.next().transpose()?.as_deref() == Some("started"),
-            "the capture child didn't start"
+        std::fs::create_dir_all(&self.dir)?;
+        let target = crate::capture::discover_target(None);
+        let session = crate::capture::ScreenCaptureSession::start(
+            target.clone(),
+            Some(self.dir.join("recording.mp4")),
+            self.excluded.clone(),
         );
-        // The rest of its output (the bundle line) passes through.
-        std::thread::spawn(move || lines.map_while(Result::ok).for_each(|line| println!("{line}")));
+        let excluded = self.excluded.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
         eprintln!("rune lab: capturing, excluding windows {excluded:?}");
-        *self.child.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(child);
+        *self.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some((target, session));
         Ok(())
     }
 
-    /// Closes the child's stdin, so it stops and builds the bundle, and waits for it.
+    /// Stops the capture and builds its bundle.
     fn finish(&self) -> anyhow::Result<()> {
-        let Some(mut child) = self.child.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take() else {
+        let Some((target, session)) = self.session.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take()
+        else {
             anyhow::bail!("the capture never started");
         };
-        drop(child.stdin.take());
-        let status = child.wait()?;
-        anyhow::ensure!(status.success(), "the capture child failed ({status})");
+        let excluded = self.excluded.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+        crate::finalize_capture_bundle(
+            &self.dir,
+            target,
+            session.stop(),
+            Vec::new(),
+            Vec::new(),
+            None,
+            Some(format!("Rune capsule capture-exclusion check; excluded windows {excluded:?}")),
+            crate::windows::ActivityLog::default(),
+        )?;
+        println!("bundle {}", self.dir.display());
         Ok(())
     }
 }

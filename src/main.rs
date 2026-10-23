@@ -203,19 +203,9 @@ enum LabCommand {
         #[arg(long, requires = "snap")]
         state: Option<String>,
         /// With --rune: make a real Screen capture of the capsule's display while the scene
-        /// plays, with the capsule left out (`SCRAWL_LAB_EXCLUDE` picks how), into this bundle.
+        /// plays, with the capsule left out as the app leaves out its own panels, into this bundle.
         #[arg(long, requires = "rune", conflicts_with = "snap")]
         capture: Option<PathBuf>,
-    },
-    /// A Screen capture of the display under the pointer, leaving out the given windows, until
-    /// stdin closes, finished into a bundle at OUT (`lab pill --rune --capture` runs it).
-    #[command(hide = true)]
-    Capture {
-        #[arg(long)]
-        out: PathBuf,
-        /// CGWindowIDs left out of the capture (ScreenCaptureKit's exclusion filter).
-        #[arg(long)]
-        exclude: Vec<u32>,
     },
 }
 
@@ -2021,33 +2011,6 @@ fn main() -> Result<()> {
                 repeat,
                 backdrop: !no_backdrop,
             });
-            Ok(())
-        }
-        Command::Lab {
-            command: LabCommand::Capture { out, exclude },
-        } => {
-            std::fs::create_dir_all(&out)?;
-            let target = discover_target(None);
-            let session = ScreenCaptureSession::start(
-                target.clone(),
-                Some(out.join("recording.mp4")),
-                std::sync::Arc::new(std::sync::Mutex::new(exclude.clone())),
-            );
-            println!("started");
-            std::io::Write::flush(&mut std::io::stdout())?;
-            std::io::copy(&mut std::io::stdin(), &mut std::io::sink())?;
-            let recording = session.stop();
-            finalize_capture_bundle(
-                &out,
-                target,
-                recording,
-                Vec::new(),
-                Vec::new(),
-                None,
-                Some(format!("Rune capsule capture-exclusion check; excluded windows {exclude:?}")),
-                windows::ActivityLog::default(),
-            )?;
-            println!("bundle {}", out.display());
             Ok(())
         }
         Command::Tune { command } => ui::tune_command(match command.unwrap_or(TuneCommand::List) {
