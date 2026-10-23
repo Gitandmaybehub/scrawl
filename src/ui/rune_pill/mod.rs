@@ -391,7 +391,8 @@ fn presence_spring(surface: &Surface) -> rune::Spring {
 
 fn placed(e: El, shown: &Shown) -> El {
     let [x, y, w, h] = shown.rect;
-    e.key(shown.key.clone()).absolute(x, y).size(w, h).motion(shown.motion)
+    let e = e.key(shown.key.clone()).absolute(x, y).size(w, h);
+    if shown.moved { e.motion(shown.motion) } else { e }
 }
 
 fn shell(surface: &Surface) -> El {

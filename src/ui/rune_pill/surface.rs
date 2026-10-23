@@ -36,7 +36,7 @@ const COLLAPSE_WAIT_S: f32 = 0.07;
 pub const EXIT_RATIO: f32 = 0.6;
 /// Entering content waits this long over the spot of something leaving, so the two never
 /// crossfade on top of each other (Rune fades a group child by child).
-const OVERLAP_WAIT_S: f32 = 0.08;
+const OVERLAP_WAIT_S: f32 = 0.11;
 const ENTRY_CONTENT_DELAY_S: f32 = 0.016;
 const STAGGER_S: f32 = 0.008;
 /// Opening, sliding content takes this many times the walls' duration (`pill.follow`).
@@ -211,9 +211,11 @@ pub struct Shown {
     pub rect: [f32; 4],
     pub active: bool,
     pub enabled: bool,
-    /// The spring for this element's next layout change. While it mounts it's the fade the
-    /// element enters with (Rune derives its presence springs from it).
+    /// The spring for this element's next layout change.
     pub motion: Spring,
+    /// It has moved since it mounted. Until then the view leaves its motion unset: Rune takes an
+    /// element's presence springs from a motion set while it mounts, overriding its transition's.
+    pub moved: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -336,6 +338,7 @@ impl Surface {
             active: item.active,
             enabled: item.enabled,
             motion,
+            moved: false,
         }
     }
 
@@ -354,6 +357,7 @@ impl Surface {
             active: true,
             enabled: false,
             motion,
+            moved: false,
         })
     }
 
@@ -498,6 +502,7 @@ impl Surface {
         for item in &items {
             if let Some(shown) = self.items.iter_mut().find(|s| s.id == item.id) {
                 shown.motion = item_spring;
+                shown.moved = true;
                 shown.rect = item.rect;
                 shown.active = item.active;
                 shown.enabled = item.enabled;
@@ -508,6 +513,7 @@ impl Surface {
         match (&mut self.highlight, &active) {
             (Some(h), Some(a)) => {
                 h.motion = if h.id == a.id { item_spring } else { HIGHLIGHT };
+                h.moved = true;
                 h.id = a.id;
                 h.rect = a.rect;
             }
@@ -718,6 +724,8 @@ mod tests {
         assert_eq!(s.shell, wide);
         let now = run(&mut s, now, now + 0.05);
         assert!(s.shell[2] < wide[2]);
+        assert!(!s.items.iter().any(|i| i.id == ElemId::Finish), "Finish waits for the chips under it");
+        let now = run(&mut s, now, now + 0.05);
         assert!(s.items.iter().any(|i| i.id == ElemId::Finish));
 
         let now = run(&mut s, now, now + 1.0);
