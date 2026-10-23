@@ -5568,7 +5568,6 @@ dependencies = [
  "png 0.18.1",
  "raw-window-handle",
  "rune",
- "rune-motion",
  "screencapturekit",
  "serde",
  "serde_json",

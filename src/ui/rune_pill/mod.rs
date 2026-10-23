@@ -672,30 +672,36 @@ fn system_fonts() -> &'static [&'static [u8]] {
     }
 }
 
-/// Rune reads its tooling flags from the process's arguments, and `--trace` there means its own
-/// trace (headless). Scrawl's `--trace` (already in `SCRAWL_MOTION_TRACE`) is re-executed away.
-fn strip_trace_flag() {
+/// Rune reads its tooling flags from the process's arguments, so the lab re-execs itself with
+/// arguments Rune reads the way clap did (`rune_args`) when they differ.
+fn exec_with_rune_args() {
     use std::os::unix::process::CommandExt;
-    let args: Vec<String> = std::env::args().collect();
-    if !args.iter().any(|a| a == "--trace" || a.starts_with("--trace=")) {
-        return;
-    }
-    let mut kept = Vec::with_capacity(args.len());
-    let mut skip = false;
-    for arg in args.into_iter().skip(1) {
-        if std::mem::take(&mut skip) {
-            continue;
-        }
-        if arg == "--trace" {
-            skip = true;
-        } else if !arg.starts_with("--trace=") {
-            kept.push(arg);
-        }
-    }
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let Some(args) = rune_args(&args) else { return };
     let Ok(exe) = std::env::current_exe() else { return };
-    let error = std::process::Command::new(exe).args(kept).exec();
-    eprintln!("rune lab: couldn't re-exec without --trace: {error}");
+    let error = std::process::Command::new(exe).args(args).exec();
+    eprintln!("rune lab: couldn't re-exec for Rune's argument parser: {error}");
     std::process::exit(1);
+}
+
+/// `args` without Scrawl's `--trace` (a motion-lint file, already in `SCRAWL_MOTION_TRACE`),
+/// which Rune would take for its own headless trace, and with `--snap=PATH` split into
+/// `--snap PATH`, the only form Rune reads. `None` when nothing changes.
+fn rune_args(args: &[String]) -> Option<Vec<String>> {
+    let mut out = Vec::with_capacity(args.len());
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        if arg == "--trace" {
+            rest.next();
+        } else if arg.starts_with("--trace=") {
+            continue;
+        } else if let Some(path) = arg.strip_prefix("--snap=") {
+            out.extend(["--snap".to_owned(), path.to_owned()]);
+        } else {
+            out.push(arg.clone());
+        }
+    }
+    (out != args).then_some(out)
 }
 
 /// `--snap DIR`: one headless run per state, each `--snap DIR/<state>.png --state <state>`.
@@ -721,7 +727,7 @@ pub fn run(options: Options) -> anyhow::Result<()> {
     {
         return snap_all(&options, snap);
     }
-    strip_trace_flag();
+    exec_with_rune_args();
     let fonts = system_fonts();
     let _ = FONTS.set(fonts);
     let still = match options.snap.as_ref().map(|_| options.state.as_deref().unwrap_or("picker")) {
@@ -794,4 +800,23 @@ pub fn run(options: Options) -> anyhow::Result<()> {
         windows
     });
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::rune_args;
+
+    fn args(s: &str) -> Vec<String> {
+        s.split(' ').map(str::to_owned).collect()
+    }
+
+    #[test]
+    fn rune_gets_snap_as_two_tokens_and_no_trace() {
+        assert_eq!(
+            rune_args(&args("lab pill finish --rune --snap=out.png --trace t.jsonl")),
+            Some(args("lab pill finish --rune --snap out.png"))
+        );
+        assert_eq!(rune_args(&args("lab pill finish --trace=t.jsonl --rune")), Some(args("lab pill finish --rune")));
+        assert_eq!(rune_args(&args("lab pill finish --rune --snap out.png")), None);
+    }
 }
