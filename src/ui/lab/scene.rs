@@ -10,7 +10,7 @@ pub(in crate::ui) const PROCESSING_S: f32 = 0.8;
 /// recording starts on a still frame.
 const LEAD_IN_S: f32 = 0.85;
 /// Quiet time after the last step (and between repeats).
-const TAIL_S: f32 = 0.75;
+pub(crate) const TAIL_S: f32 = 0.75;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum Scene {
