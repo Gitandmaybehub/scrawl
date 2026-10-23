@@ -234,8 +234,10 @@ struct Ctl {
     go: AtomicBool,
     /// The last run's tail has passed.
     done: AtomicBool,
-    /// The overlay should be shown: the capsule is up or still leaving.
+    /// `poll` has shown the overlay: the capsule is up or still leaving.
     shown: AtomicBool,
+    /// The capsule's overlay, which `poll` shows and hides.
+    pill: std::sync::OnceLock<OverlayHandle<Lab>>,
     /// The picker is open, so the capsule follows the pointer between displays (the Metal
     /// capsule's `follow_pointer_display`).
     follow: AtomicBool,
@@ -306,13 +308,18 @@ fn init() -> Lab {
 /// How long the capsule's exit gets before its overlay hides, in animation seconds.
 /// Inside the scene's tail, so the last run hides before it quits.
 const HIDE_AFTER_S: f64 = super::lab::TAIL_S as f64 - 0.1;
-/// How long before a step a hidden capsule's overlay shows, in real seconds.
-const SHOW_AHEAD_S: f64 = 0.25;
+/// How often a hidden capsule polls for `Ctl::go`, in real seconds.
+const WAIT_FOR_GO_S: f64 = 0.01;
 
 /// The lab's frame hook: tune reload, due surface steps, the scene's steps (the same `Timeline`
 /// the Metal lab steps), the clock, and what the overlay's driver should do.
 fn poll(s: &mut Lab, now: f64, tx: &mut Tx) -> bool {
-    if s.backdrop.is_some() || s.still || !s.ctl.go.load(Ordering::Acquire) {
+    if s.backdrop.is_some() || s.still {
+        return false;
+    }
+    if !s.ctl.go.load(Ordering::Acquire) {
+        // A poll that only schedules keeps the prewarmed frame current (an update wouldn't).
+        tx.wake_after(Duration::from_secs_f64(WAIT_FOR_GO_S));
         return false;
     }
     s.now = now;
@@ -371,15 +378,14 @@ fn poll(s: &mut Lab, now: f64, tx: &mut Tx) -> bool {
     if hidden && leaving > 0.0 {
         wake = Some(wake.map_or(leaving, |w| w.min(leaving)));
     }
-    // A change made while the overlay is hidden is settled when it shows (`show` re-warms a
-    // dirty prewarmed overlay), so it shows before the step that brings the capsule in, not
-    // with it (the hidden capsule draws nothing).
-    let ahead = s.timeline.next_at().map(|at| (at - anim) / scale - SHOW_AHEAD_S);
-    let soon = ahead.is_some_and(|a| a <= 0.0);
-    if hidden && let Some(a) = ahead.filter(|a| *a > 0.0) {
-        wake = Some(wake.map_or(a, |w| w.min(a)));
+    // Shown in the same poll as the step that brings the capsule in, so Rune reveals the
+    // prewarmed hidden pose and animates the entry from it.
+    let shown = !hidden || leaving > 0.0;
+    if s.ctl.shown.swap(shown, Ordering::AcqRel) != shown
+        && let Some(pill) = s.ctl.pill.get()
+    {
+        if shown { pill.show() } else { pill.hide() }
     }
-    s.ctl.shown.store(!hidden || leaving > 0.0 || soon, Ordering::Release);
     s.ctl.follow.store(
         matches!(s.surface.pres, Pres::Selecting { mode, .. } if mode != SelectionMode::Iphone),
         Ordering::Release,
@@ -870,6 +876,7 @@ pub fn run(options: Options) -> anyhow::Result<()> {
             lab,
         );
         place(&pill, &here, here.pill, [PANEL_W, PANEL_H]);
+        let _ = ctl.pill.set(pill.clone());
         let quit = app.handle();
         std::thread::Builder::new()
             .name("rune-pill-driver".into())
@@ -1005,9 +1012,9 @@ impl Capture {
     }
 }
 
-/// Does what `poll` can't from inside the overlay: starts it once any capture is running, shows
-/// and hides it, moves it to the pointer's display while the picker is open, and quits (an
-/// overlay's `Tx::quit` doesn't reach the app).
+/// Does what `poll` can't from inside the overlay: starts it once any capture is running, moves
+/// it to the pointer's display while the picker is open, and quits (an overlay's `Tx::quit`
+/// doesn't reach the app).
 struct Driver {
     pill: OverlayHandle<Lab>,
     backdrop: Option<OverlayHandle<Lab>>,
@@ -1026,19 +1033,11 @@ fn drive(mut d: Driver, quit: rune::AppHandle<Lab>) {
     {
         std::thread::sleep(Duration::from_millis(10));
     }
-    // The first poll starts the timeline: a hidden overlay runs a frame for an update (no
-    // draw), and `poll` asks for the rest with `Tx::wake_after`.
+    // The hidden capsule's next poll starts the timeline.
     d.ctl.go.store(true, Ordering::Release);
-    d.pill.update(|_, tx| tx.wake_after(Duration::ZERO));
-    let mut shown = false;
     loop {
         if d.ctl.done.load(Ordering::Acquire) {
             break;
-        }
-        let want = d.ctl.shown.load(Ordering::Acquire);
-        if want != shown {
-            shown = want;
-            if want { d.pill.show() } else { d.pill.hide() }
         }
         if d.ctl.follow.load(Ordering::Acquire)
             && let Some(p) = crate::screens::pointer()
