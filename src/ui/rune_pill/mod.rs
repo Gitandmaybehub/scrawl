@@ -22,7 +22,7 @@ use rune::{
 };
 
 use self::surface::{DONE_TEXT_X, LEAD_TEXT_X, PANEL_H, PROCESSING_TEXT_X, Shown, Surface};
-use super::lab::{BACKDROP, LEAD_IN_S, Scene, Step, TAIL_S};
+use super::lab::{BACKDROP, Scene, Step, Timeline};
 use super::{SelectionMode, motion};
 use crate::native::pill::model::{CHIP_H, ElemId, HUD_TEXT, PANEL_W, PANEL_Y, Pres};
 
@@ -218,12 +218,8 @@ pub struct Lab {
     still: bool,
     surface: Surface,
     meter: Meter,
-    steps: Vec<(f32, Step)>,
-    next: usize,
-    /// Animation seconds the current run's steps count from (after its lead-in).
-    run_start: Option<f64>,
-    runs: u32,
-    repeat: u32,
+    /// The scene's steps, shared with the Metal lab.
+    timeline: Timeline,
     recording_since: Option<f64>,
     now: f64,
 }
@@ -237,11 +233,7 @@ impl Lab {
             still: false,
             surface: Surface::new(motion::tune(), metrics),
             meter,
-            steps: scene.steps(),
-            next: 0,
-            run_start: None,
-            runs: 0,
-            repeat,
+            timeline: Timeline::new(scene, repeat),
             recording_since: None,
             now: 0.0,
         }
@@ -282,7 +274,8 @@ fn init() -> Lab {
     Lab::capsule(Scene::Picker, 1, Meter::new())
 }
 
-/// The lab's frame hook: tune reload, due surface steps, the scene's steps, the clock.
+/// The lab's frame hook: tune reload, due surface steps, the scene's steps (the same `Timeline`
+/// the Metal lab steps), the clock.
 fn poll(s: &mut Lab, now: f64, tx: &mut Tx) -> bool {
     if s.backdrop.is_some() || s.still {
         return false;
@@ -295,29 +288,20 @@ fn poll(s: &mut Lab, now: f64, tx: &mut Tx) -> bool {
     s.meter.time_scale.store(s.surface.time_scale.to_bits(), Ordering::Relaxed);
     let scale = f64::from(s.surface.time_scale);
     let anim = s.surface.anim(now);
-    let run_start = *s.run_start.get_or_insert(anim + f64::from(LEAD_IN_S));
 
     let mut changed = s.surface.tick(now);
-    while let Some(&(at, step)) = s.steps.get(s.next)
-        && run_start + f64::from(at) <= anim
-    {
-        s.next += 1;
+    let due = s.timeline.advance(anim);
+    for step in due.steps {
         s.apply(step, now);
         changed = true;
     }
     if changed {
         s.track_recording(anim);
     }
-    let end = run_start + f64::from(s.steps.last().map_or(0.0, |(at, _)| *at) + TAIL_S);
-    if s.next >= s.steps.len() && anim >= end {
-        s.runs += 1;
-        if s.repeat != 0 && s.runs >= s.repeat {
-            motion::trace_close();
-            tx.quit();
-            return changed;
-        }
-        s.next = 0;
-        s.run_start = Some(anim + f64::from(LEAD_IN_S));
+    if due.done {
+        motion::trace_close();
+        tx.quit();
+        return changed;
     }
 
     // The clock reads off the animation time, like the app's pretend recording.
@@ -333,12 +317,9 @@ fn poll(s: &mut Lab, now: f64, tx: &mut Tx) -> bool {
         let tick = (whole as f64 + 1.0 - secs) / scale;
         wake = Some(wake.map_or(tick, |w| w.min(tick)));
     }
-    if let Some(&(at, _)) = s.steps.get(s.next) {
-        let step = (run_start + f64::from(at) - anim) / scale;
+    if let Some(at) = s.timeline.next_at() {
+        let step = (at - anim) / scale;
         wake = Some(wake.map_or(step, |w| w.min(step)));
-    } else {
-        let tail = (end - anim) / scale;
-        wake = Some(wake.map_or(tail, |w| w.min(tail)));
     }
     if let Some(wake) = wake {
         tx.wake_after(Duration::from_secs_f64(wake.max(0.0)));

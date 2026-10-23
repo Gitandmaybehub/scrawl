@@ -14,6 +14,7 @@ use crate::native::pill::model::{
     CHIP_GAP, CHIP_H, CX, ElemId, ISLAND_H, ISLAND_INSET, Metrics, Pres, TOP,
 };
 use crate::ui::SelectionMode;
+use crate::ui::lab::PROCESSING_S;
 use crate::ui::motion::Tune;
 
 /// Taller than the capsule so its drop shadow fades out inside the window (the SwiftUI panel).
@@ -43,7 +44,6 @@ const STAGGER_S: f32 = 0.008;
 const FOLLOW: f32 = 1.15;
 /// The selection highlight trails a mode change in place.
 const HIGHLIGHT: Spring = Spring::new(0.25, 0.0);
-pub const PROCESSING_S: f32 = 0.8;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Item {
