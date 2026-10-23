@@ -19,7 +19,7 @@ pub const BACKDROP: [f32; 4] = [0.0, 38.0, 640.0, 76.0];
 
 mod scene;
 
-pub(super) use scene::{PROCESSING_S, Step, Timeline};
+pub(super) use scene::{PROCESSING_S, Step, TAIL_S, Timeline};
 pub use scene::Scene;
 
 pub struct Options {

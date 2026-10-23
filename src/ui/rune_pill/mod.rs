@@ -229,6 +229,9 @@ pub struct Lab {
 /// What `poll` tells the thread driving the overlay (`drive`), which has no view of the state.
 #[derive(Default)]
 struct Ctl {
+    /// `drive` has started the scene (after any capture): until then `poll` does nothing, so
+    /// prewarm frames don't start the timeline.
+    go: AtomicBool,
     /// The last run's tail has passed.
     done: AtomicBool,
     /// The overlay should be shown: the capsule is up or still leaving.
@@ -301,14 +304,15 @@ fn init() -> Lab {
 }
 
 /// How long the capsule's exit gets before its overlay hides, in animation seconds.
-const HIDE_AFTER_S: f64 = 0.8;
+/// Inside the scene's tail, so the last run hides before it quits.
+const HIDE_AFTER_S: f64 = super::lab::TAIL_S as f64 - 0.1;
 /// How long before a step a hidden capsule's overlay shows, in real seconds.
 const SHOW_AHEAD_S: f64 = 0.25;
 
 /// The lab's frame hook: tune reload, due surface steps, the scene's steps (the same `Timeline`
 /// the Metal lab steps), the clock, and what the overlay's driver should do.
 fn poll(s: &mut Lab, now: f64, tx: &mut Tx) -> bool {
-    if s.backdrop.is_some() || s.still {
+    if s.backdrop.is_some() || s.still || !s.ctl.go.load(Ordering::Acquire) {
         return false;
     }
     s.now = now;
@@ -1021,8 +1025,9 @@ fn drive(mut d: Driver, quit: rune::AppHandle<Lab>) {
     {
         std::thread::sleep(Duration::from_millis(10));
     }
-    // The first poll: a hidden overlay runs a frame for an update (no draw), and `poll` asks
-    // for the rest with `Tx::wake_after`.
+    // The first poll starts the timeline: a hidden overlay runs a frame for an update (no
+    // draw), and `poll` asks for the rest with `Tx::wake_after`.
+    d.ctl.go.store(true, Ordering::Release);
     d.pill.update(|_, tx| tx.wake_after(Duration::ZERO));
     let mut shown = false;
     loop {
