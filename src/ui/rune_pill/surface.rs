@@ -4,9 +4,10 @@
 //! here; Rune animates between the targets.
 //!
 //! Timing that a spring can't express lives here too, as pending steps the app's poll hook runs:
-//! narrowing waits `COLLAPSE_WAIT_S` so leaving chips fade before a wall crosses them, an
-//! entering chip waits for whatever leaves under it, and it mounts once the walls have room for it (predicted from the same analytic spring
-//! Rune animates the walls on).
+//! narrowing waits `COLLAPSE_WAIT_S` so leaving chips fade before a wall crosses them, and an
+//! entering chip mounts once the walls have room for it (predicted from the same analytic spring
+//! Rune animates the walls on). Content entering over content that leaves crossfades with it (the
+//! view's `dissolve` scope).
 
 use rune::Spring;
 
@@ -35,9 +36,6 @@ const COLLAPSE_WAIT_S: f32 = 0.07;
 /// Leaving content fades on this fraction of the entering fade, so it's mostly gone (≈ 0.3
 /// opacity) by the time a wall crosses it: Rune has no capsule mask to hide it behind.
 pub const EXIT_RATIO: f32 = 0.6;
-/// Entering content waits this long over the spot of something leaving, so the two never
-/// crossfade on top of each other (Rune fades a group child by child).
-const OVERLAP_WAIT_S: f32 = 0.11;
 const ENTRY_CONTENT_DELAY_S: f32 = 0.016;
 const STAGGER_S: f32 = 0.008;
 /// Opening, sliding content takes this many times the walls' duration (`pill.follow`).
@@ -258,8 +256,6 @@ pub struct Surface {
     /// Session routes the Completed island offers ("Send to …"; state only for now).
     pub routes: Vec<String>,
     pending: Vec<(f64, u64, Step)>,
-    /// Where content left at the last change (animation seconds, rects).
-    leaving: (f64, Vec<[f32; 4]>),
     target: Option<([f32; 4], Vec<Item>, Change)>,
     walls: [Wall; 3],
     generation: u64,
@@ -289,7 +285,6 @@ impl Surface {
             events: Vec::new(),
             routes: Vec::new(),
             pending: Vec::new(),
-            leaving: (0.0, Vec::new()),
             target: None,
             walls: [Wall::at_rest(shell[0]), Wall::at_rest(shell[0] + shell[2]), Wall::at_rest(TOP + shell[3] * TOP_FROM)],
             generation: 0,
@@ -440,12 +435,7 @@ impl Surface {
             (Pres::Recording { .. }, Pres::Selecting { .. }) => Change::Switch,
             _ => Change::Phase,
         };
-        let gone: Vec<[f32; 4]> =
-            self.items.iter().filter(|s| !items.iter().any(|i| i.id == s.id)).map(|s| s.rect).collect();
-        let leaving = !gone.is_empty();
-        if leaving {
-            self.leaving = (t, gone);
-        }
+        let leaving = self.items.iter().any(|s| !items.iter().any(|i| i.id == s.id));
         self.items.retain(|s| items.iter().any(|i| i.id == s.id));
         if self.highlight.as_ref().is_some_and(|h| !items.iter().any(|i| i.active && i.id == h.id))
             && !items.iter().any(|i| i.active)
@@ -532,13 +522,7 @@ impl Surface {
             } else {
                 self.room_delay(item.rect, t, false)
             };
-            let overlaps = |r: &[f32; 4]| r[0] < item.rect[0] + item.rect[2] && item.rect[0] < r[0] + r[2];
-            let clear = if self.leaving.1.iter().any(overlaps) {
-                (OVERLAP_WAIT_S - (t - self.leaving.0) as f32).max(0.0)
-            } else {
-                0.0
-            };
-            let delay = room.max(clear) + STAGGER_S * rank as f32;
+            let delay = room + STAGGER_S * rank as f32;
             rank += 1;
             let shown = self.shown(item, presence);
             if item.active && self.highlight.is_none() {
@@ -724,9 +708,10 @@ mod tests {
         assert_eq!(s.shell, wide);
         let now = run(&mut s, now, now + 0.05);
         assert!(s.shell[2] < wide[2]);
-        assert!(!s.items.iter().any(|i| i.id == ElemId::Finish), "Finish waits for the chips under it");
-        let now = run(&mut s, now, now + 0.05);
-        assert!(s.items.iter().any(|i| i.id == ElemId::Finish));
+        assert!(
+            s.items.iter().any(|i| i.id == ElemId::Finish),
+            "Finish crossfades over the chips leaving under it"
+        );
 
         let now = run(&mut s, now, now + 1.0);
         s.finish(now);

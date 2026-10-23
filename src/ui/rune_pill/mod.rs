@@ -360,10 +360,14 @@ fn view(s: &Lab, cx: &mut Cx<Lab>) -> El {
                 .transition(presence),
         );
     }
+    // Content entering over content that leaves (lead → Processing → done, chips → Finish)
+    // crossfades additively, without a midpoint alpha dip. The shell and the highlight are shared
+    // backgrounds, so they stay outside; nothing inside overlaps at rest.
+    let mut content = el().key("content").absolute(0.0, 0.0).size(PANEL_W, PANEL_H).dissolve();
     for shown in &surface.items {
-        root = root.child(item(s, shown).transition(presence));
+        content = content.child(item(s, shown).transition(presence));
     }
-    root
+    root.child(content)
 }
 
 fn presence_spring(surface: &Surface) -> rune::Spring {
