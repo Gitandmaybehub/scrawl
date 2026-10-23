@@ -12,7 +12,7 @@ mod surface;
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use rune::color::srgb_decode;
@@ -229,8 +229,6 @@ pub struct Lab {
 /// What `poll` tells the thread driving the overlay (`drive`), which has no view of the state.
 #[derive(Default)]
 struct Ctl {
-    /// The next poll, seconds on the overlay's clock as `f64` bits; 0 polls at once.
-    next: AtomicU64,
     /// The last run's tail has passed.
     done: AtomicBool,
     /// The overlay should be shown: the capsule is up or still leaving.
@@ -242,15 +240,10 @@ struct Ctl {
 }
 
 impl Ctl {
-    fn wake_at(&self, at: Option<f64>) {
-        self.next.store(at.unwrap_or(f64::INFINITY).to_bits(), Ordering::Release);
+    fn notify(&self) {
         if let Some(driver) = self.driver.get() {
             driver.unpark();
         }
-    }
-
-    fn next(&self) -> f64 {
-        f64::from_bits(self.next.load(Ordering::Acquire))
     }
 }
 
@@ -307,11 +300,13 @@ fn init() -> Lab {
     Lab::capsule(Scene::Picker, 1, Meter::new())
 }
 
-/// The lab's frame hook: tune reload, due surface steps, the scene's steps (the same `Timeline`
-/// the Metal lab steps), the clock.
 /// How long the capsule's exit gets before its overlay hides, in animation seconds.
 const HIDE_AFTER_S: f64 = 0.8;
+/// How long before a step a hidden capsule's overlay shows, in real seconds.
+const SHOW_AHEAD_S: f64 = 0.25;
 
+/// The lab's frame hook: tune reload, due surface steps, the scene's steps (the same `Timeline`
+/// the Metal lab steps), the clock, and what the overlay's driver should do.
 fn poll(s: &mut Lab, now: f64, tx: &mut Tx) -> bool {
     if s.backdrop.is_some() || s.still {
         return false;
@@ -337,7 +332,7 @@ fn poll(s: &mut Lab, now: f64, tx: &mut Tx) -> bool {
     if due.done {
         motion::trace_close();
         s.ctl.done.store(true, Ordering::Release);
-        s.ctl.wake_at(None);
+        s.ctl.notify();
         return changed;
     }
 
@@ -372,12 +367,22 @@ fn poll(s: &mut Lab, now: f64, tx: &mut Tx) -> bool {
     if hidden && leaving > 0.0 {
         wake = Some(wake.map_or(leaving, |w| w.min(leaving)));
     }
-    s.ctl.shown.store(!hidden || leaving > 0.0, Ordering::Release);
+    // Rune settles every transition when an overlay shows, so it shows before the step that
+    // brings the capsule in, not with it (the hidden capsule draws nothing).
+    let ahead = s.timeline.next_at().map(|at| (at - anim) / scale - SHOW_AHEAD_S);
+    let soon = ahead.is_some_and(|a| a <= 0.0);
+    if hidden && let Some(a) = ahead.filter(|a| *a > 0.0) {
+        wake = Some(wake.map_or(a, |w| w.min(a)));
+    }
+    s.ctl.shown.store(!hidden || leaving > 0.0 || soon, Ordering::Release);
     s.ctl.follow.store(
         matches!(s.surface.pres, Pres::Selecting { mode, .. } if mode != SelectionMode::Iphone),
         Ordering::Release,
     );
-    s.ctl.wake_at(wake.map(|w| now + w.max(0.0)));
+    if let Some(wake) = wake {
+        tx.wake_after(Duration::from_secs_f64(wake.max(0.0)));
+    }
+    s.ctl.notify();
 
     for event in s.surface.events.drain(..) {
         motion::trace_event(event);
@@ -636,9 +641,7 @@ fn icon(id: ElemId, width: f32, color: Color) -> Shape {
 // ─── Motion trace ────────────────────────────────────────────────────────────────────────────
 
 /// Draws Rune's frame, then writes it to the motion-lint trace with the Metal capsule's names
-/// (`shell`, `lead`, `chip:Area`, … in screen points), so the two traces compare. Unused while
-/// Rune's overlays take no compositor (asked of Rune); the window host used it.
-#[allow(dead_code)]
+/// (`shell`, `lead`, `chip:Area`, … in screen points), so the two traces compare.
 struct TraceFrames {
     origin: [f32; 2],
 }
@@ -810,7 +813,9 @@ pub fn run(options: Options) -> anyhow::Result<()> {
 
         let meter = Meter::new();
         meter.clone().spawn();
-        let mut app = App::new(spec((PANEL_W, PANEL_H), fonts)).windowless();
+        // Only the capsule polls (`ConfiguredOverlay::poll`): overlays whose state type matches
+        // inherit the app's poll, and the backdrop is a `Lab` too.
+        let mut app = App::new(AppSpec { poll: None, ..spec((PANEL_W, PANEL_H), fonts) }).windowless();
         let backdrop = backdrop.then(|| {
             let mut state = Lab::capsule(scene, repeat, meter.clone());
             state.backdrop = Some(backdrop_fill());
@@ -830,8 +835,7 @@ pub fn run(options: Options) -> anyhow::Result<()> {
         let excluded: Arc<std::sync::Mutex<Vec<u32>>> = Arc::default();
         let capture = capture.map(|dir| Arc::new(Capture::new(dir, excluded.clone())));
         let created = capture.clone();
-        // The overlay's clock (`Runtime::wall_start`) starts as it's made.
-        let t0 = Instant::now();
+        let origin = [here.frame[0] as f32 + here.pill[0], here.frame[1] as f32 + here.pill[1]];
         let pill = app.overlay(
             OverlaySpec::new("Scrawl capsule (Rune)", (PANEL_W, PANEL_H), view)
                 .options(OverlayOptions {
@@ -842,6 +846,8 @@ pub fn run(options: Options) -> anyhow::Result<()> {
                     prewarm: true,
                     ..Default::default()
                 })
+                .poll(poll)
+                .compositor(TraceFrames { origin })
                 .on_created(move |made| {
                     eprintln!(
                         "rune lab: capsule overlay window {:?}, native capture exclusion {:?}",
@@ -862,7 +868,7 @@ pub fn run(options: Options) -> anyhow::Result<()> {
         let quit = app.handle();
         std::thread::Builder::new()
             .name("rune-pill-driver".into())
-            .spawn(move || drive(Driver { pill, backdrop, ctl, t0, places, at: start, capture }, quit))
+            .spawn(move || drive(Driver { pill, backdrop, ctl, places, at: start, capture }, quit))
             .expect("driver thread");
         vec![WindowSpec::from_app("lab", app)]
     });
@@ -996,14 +1002,13 @@ impl Capture {
     }
 }
 
-/// Plays the scene into the overlay from outside: Rune's overlays take `update`s but have no
-/// poll hook yet, so this thread runs `poll` when it asked to be run, shows and hides the
-/// overlay, moves it to the pointer's display while the picker is open, and quits.
+/// Does what `poll` can't from inside the overlay: starts it once any capture is running, shows
+/// and hides it, moves it to the pointer's display while the picker is open, and quits (an
+/// overlay's `Tx::quit` doesn't reach the app).
 struct Driver {
     pill: OverlayHandle<Lab>,
     backdrop: Option<OverlayHandle<Lab>>,
     ctl: Arc<Ctl>,
-    t0: Instant,
     places: Vec<Place>,
     at: usize,
     capture: Option<Arc<Capture>>,
@@ -1018,20 +1023,13 @@ fn drive(mut d: Driver, quit: rune::AppHandle<Lab>) {
     {
         std::thread::sleep(Duration::from_millis(10));
     }
+    // The first poll: a hidden overlay runs a frame for an update (no draw), and `poll` asks
+    // for the rest with `Tx::wake_after`.
+    d.pill.update(|_, tx| tx.wake_after(Duration::ZERO));
     let mut shown = false;
     loop {
         if d.ctl.done.load(Ordering::Acquire) {
             break;
-        }
-        let now = d.t0.elapsed().as_secs_f64();
-        let next = d.ctl.next();
-        if next <= now {
-            // Nothing more until this poll says when.
-            d.ctl.next.store(f64::INFINITY.to_bits(), Ordering::Release);
-            let t0 = d.t0;
-            d.pill.update(move |s, tx| {
-                poll(s, t0.elapsed().as_secs_f64(), tx);
-            });
         }
         let want = d.ctl.shown.load(Ordering::Acquire);
         if want != shown {
@@ -1050,8 +1048,7 @@ fn drive(mut d: Driver, quit: rune::AppHandle<Lab>) {
                 place(backdrop, here, here.backdrop, [BACKDROP[2], BACKDROP[3]]);
             }
         }
-        let wait = (d.ctl.next() - d.t0.elapsed().as_secs_f64()).clamp(0.0, 0.05);
-        std::thread::park_timeout(Duration::from_secs_f64(wait));
+        std::thread::park_timeout(Duration::from_millis(50));
     }
     if let Some(capture) = &d.capture
         && let Err(error) = capture.finish()

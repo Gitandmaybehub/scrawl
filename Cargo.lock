@@ -5276,13 +5276,15 @@ checksum = "6c20b6793b5c2fa6553b250154b78d6d0db37e72700ae35fad9387a46f487c97"
 [[package]]
 name = "rune"
 version = "0.0.1"
-source = "git+https://github.com/anomalyco/rune?rev=28ef7186f40e4fee1e7b6976de2cd2c937ed3532#28ef7186f40e4fee1e7b6976de2cd2c937ed3532"
+source = "git+https://github.com/anomalyco/rune?rev=bc8bd76b4aecf2d7d7c285f730768da68b2eabbf#bc8bd76b4aecf2d7d7c285f730768da68b2eabbf"
 dependencies = [
  "arboard",
  "blake3",
  "block2 0.5.1",
  "bytemuck",
+ "half",
  "image",
+ "libloading",
  "objc2 0.5.3",
  "objc2 0.6.5",
  "objc2-app-kit 0.2.2",
@@ -5309,12 +5311,13 @@ dependencies = [
  "winit",
  "x11rb",
  "xkbcommon",
+ "zeroize",
 ]
 
 [[package]]
 name = "rune-motion"
 version = "0.1.0"
-source = "git+https://github.com/anomalyco/rune?rev=28ef7186f40e4fee1e7b6976de2cd2c937ed3532#28ef7186f40e4fee1e7b6976de2cd2c937ed3532"
+source = "git+https://github.com/anomalyco/rune?rev=bc8bd76b4aecf2d7d7c285f730768da68b2eabbf#bc8bd76b4aecf2d7d7c285f730768da68b2eabbf"
 
 [[package]]
 name = "rust-embed"
